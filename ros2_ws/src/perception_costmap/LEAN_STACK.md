@@ -101,7 +101,7 @@ shows up.
 | P6 | the Nav2 bridge flattens the graded costmap to a binary ring | 1 h (config) / 1 day (plugin) | **the headline for path quality** — Nav2 never sees the ramp or the per-class halos, only cells >= 97, re-inflated with its own radius |
 | P7 | temporal filter has one threshold, no hysteresis | hours, offline | intermittently-seen cells sit on the threshold and toggle; every crossing adds/removes a lethal cell plus its halo, and the planner twitches |
 | P8 | no speckle opening on the fused BEV obstacle grid | hours, offline | 1-2 cell IPM blobs become lethal cores with halos; the planner swerves around ghosts |
-| P2 | segmentation caching — **done** (`bc95360`), unmeasured on the lean stack | the A/B itself | expect ~20% of ticks skipped at 8 Hz cameras / 10 Hz tick |
+| P2 | segmentation caching — **done and measured** (`bc95360`) | — | 20.1% of segmentations skipped, no rate change; CPU saving (~3.5% of a core) is below what a live scene lets you measure |
 | P9 | depth + confidence converted eagerly in the callbacks | hours | 3 cameras x 8 Hz of conversions the tick may never use |
 | P10 | only ~29% of projections use depth, rest fall back to flat-ground IPM | measure first | wrong placement on slopes, and jitter as the two paths disagree; instrument the three reject gates before tuning |
 | P5 | `line_bev.detect_bev` is 417 ms of a 452 ms tick | ~1 day + equivalence check | competition preset only (2.6 Hz); filed on the frame-cache branch |

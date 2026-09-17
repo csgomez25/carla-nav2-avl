@@ -485,12 +485,32 @@ shows where the time goes; the car's numbers decide which fixes are worth it.
 road mask, the white-line subtraction and the BEV warp on the frame's stamp, so
 a tick that is handed a frame it has already processed reuses the result;
 `/perception/reset` drops the cache and the periodic log reports
-`frames=<computed>/<cached>`. Expect **~20% of ticks skipped on the lean stack**
-(8 Hz cameras against a 10 Hz tick), not the 53% measured on the competition
-preset, where the tick is slow enough that frames repeat far more often.
-**Not yet measured on the lean stack** — three attempts on 2026-09-17 were lost
-to wedged cameras, not to the code. The A/B (lean launch with and without the
-cache, same cameras throughout) is still owed.
+`frames=<computed>/<cached>`.
+
+**Measured on the car 2026-09-17**, nine 60 s runs against one set of lean
+cameras that was never restarted, the two builds differing in exactly one file:
+
+| | costmap Hz | node CPU | segmentations skipped |
+|---|---|---|---|
+| without cache (5 runs) | 9.850 | 96.0% | — |
+| with cache (4 runs) | 9.837 | 94.25% | **20.1%** |
+
+The hit rate is exactly the predicted one and it is stable (300-303 cached of
+1500 in every run): 8 Hz cameras against a 10 Hz tick means 2 ticks in 10 are
+handed a frame already processed.
+
+The **CPU saving is not resolvable on the lean stack**, and that is arithmetic,
+not a failed change: 20% of an ~18 ms segmentation stage is ~3.6 ms/tick
+≈ 3.5% of a core, while the same build varies by 13 points run to run because
+depth projections swing with the scene (58-718 per window). Measured difference
+was 1.75 points, right sign, quarter of the noise. **Do not quote a CPU number
+for the cache on the lean stack.** It was worth 53% of segmentations on the
+competition preset, where the slow tick repeats each frame several times —
+that is where it pays.
+
+Keep it regardless: deterministic, reset-aware, no regression in rate or
+detector counters. Evidence, and the camera-teardown lessons from three failed
+attempts the same day: `logs/results/2026-09-17_lean-frame-cache-ab.md`.
 
 ### P3 — `DEPLOY.md` still blames TwinLiteNet, which the car no longer runs — FIXED (docs)
 
