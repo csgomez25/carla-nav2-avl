@@ -794,8 +794,13 @@ class CostmapNode(Node):
         msg = to_occupancy_grid_msg(cost, self.grid, stamp=stamp)
         self.costmap_pub.publish(msg)
         self._last_publish_time = now
-        self.known_pub.publish(to_occupancy_grid_msg(
-            (known.astype(np.int8) * 100), self.grid, stamp=stamp))
+        # /perception/known exists so the colorizer can tell blind cells from
+        # cheap ones; nothing in the driving path reads it. Building and
+        # serialising a second full grid every tick for nobody is waste on a
+        # run where no viewer is attached, which is every competition run.
+        if self.known_pub.get_subscription_count() > 0:
+            self.known_pub.publish(to_occupancy_grid_msg(
+                (known.astype(np.int8) * 100), self.grid, stamp=stamp))
         self._ticks += 1
         if self._ticks % 100 == 0:
             self.get_logger().info(

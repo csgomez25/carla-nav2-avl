@@ -71,7 +71,19 @@ for c in front left right; do
 done
 
 echo "== verdict"
-if echo "$ARGUS" | grep -q AlreadyAllocated; then
+# Order matters. A wedged Argus ALSO emits AlreadyAllocated -- every client that
+# retries finds the device "in use" by the stuck one -- so the sensor-open
+# failures have to be tested first. Ranking AlreadyAllocated above them reported
+# HELD on 2026-09-17 with all three drivers down and nothing holding a camera,
+# and told us a reboot would not help, which was exactly backwards.
+if echo "$ARGUS" | grep -qE 'Cannot create camera provider|NvPclOpen|Sensor could not be opened'; then
+  echo "   WEDGED -- Argus cannot open the sensors themselves."
+  echo "   Recover in this order (2026-09-17: step 2 was enough, no reboot):"
+  echo "     1. ./camera_doctor.sh --stop      (graceful SIGINT, waits for Argus)"
+  echo "     2. sudo systemctl restart percept-stack"
+  echo "     3. reboot, only if the cameras are still dead after 2."
+  echo "   Do NOT restart nvargus-daemon / zed_x_daemon; that made it worse twice."
+elif echo "$ARGUS" | grep -q AlreadyAllocated; then
   echo "   HELD -- another process owns a camera. Find it:"
   echo "     ps -eo pid,args | grep -iE 'zed|camera' | grep -v component_container"
   echo "   Stop that process; no restart or reboot helps while it holds the camera."
@@ -79,9 +91,6 @@ elif tail -c 20000 /tmp/zed_*.log 2>/dev/null | grep -q 'BadParameter'; then
   echo "   GL -- a camera opened while something held the display's GL context."
   echo "   Start RViz only AFTER the cameras (perception_stack.launch.py does this)."
   echo "   Recover: ./camera_doctor.sh --stop, then start the cameras again."
-elif echo "$ARGUS" | grep -qE 'Cannot create camera provider|NvPclOpen|Sensor could not be opened'; then
-  echo "   WEDGED -- Argus is not serving cameras. Reboot."
-  echo "   Do NOT restart nvargus-daemon / zed_x_daemon; that made it worse."
 elif tail -c 20000 /tmp/zed_*.log 2>/dev/null | grep -qE 'CAMERA REBOOTING|Connection issue'; then
   echo "   LINK -- the GMSL link is dropping mid-stream. Reseat that camera's cable"
   echo "   at both ends; it gets worse with vibration outdoors."
