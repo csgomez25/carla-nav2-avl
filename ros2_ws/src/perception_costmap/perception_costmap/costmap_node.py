@@ -56,6 +56,9 @@ class CameraSource:
         self.depth_buffer = TimestampedBuffer(maxlen=4)
         self.confidence_buffer = TimestampedBuffer(maxlen=4)
         self.last_yolo_stamp = None
+        # Per-frame perception cache, see CostmapNode._camera_perception.
+        self.percep_stamp = None
+        self.percep = None
         self.last_cone_stamp = None
         self.H, self.known = None, None
         self._node = node
@@ -382,6 +385,8 @@ class CostmapNode(Node):
         self._depth_matches = 0
         self._depth_unmatched = 0
         self._depth_waits = 0
+        self._percep_cached = 0
+        self._percep_computed = 0
         self._ticks = 0
         self._have_detection_result = False
         self._last_detection_result_time = None
@@ -474,6 +479,35 @@ class CostmapNode(Node):
         return (((bev.warp_to_bev(
             image_mask.astype(np.uint8) * 255, camera["H"], self.grid) > 127)
                  & camera["known"]), False, stats if depth_ready else None)
+
+    def _camera_perception(self, cam):
+        """Road segmentation for one camera's frame, cached on its stamp.
+
+        The tick runs at publish_rate while a camera publishes at its own rate,
+        so when the tick is the faster of the two the same frame is presented
+        more than once and this work is bit-identical every time. Segmentation
+        was ~18 ms of a ~28 ms tick with three cameras (ISSUES.md P2).
+
+        Returns ``(road_mask, road_cells)``: the image-space mask the detector
+        jobs use, and its BEV projection already clipped to the camera's
+        footprint. Neither is mutated by callers.
+        """
+        if cam.percep is not None and cam.percep_stamp == cam.stamp:
+            self._percep_cached += 1
+            return cam.percep
+        self._percep_computed += 1
+
+        road = self.segmenter(cam.img)
+        if self.use_white_lines:
+            # painted course lines are boundaries, not drivable
+            road = road & ~segmentation.white_line_mask(cam.img)
+        # clip to the camera's footprint: warpPerspective also fills
+        # mirror cells behind the camera plane (negative projective depth)
+        road_cells = (bev.warp_to_bev(
+            road.astype(np.uint8) * 255, cam.H, self.grid) > 127) & cam.known
+
+        cam.percep_stamp, cam.percep = cam.stamp, (road, road_cells)
+        return cam.percep
 
     def _process_detection_task(self, task):
         """Run all GPU detectors serially outside the ROS timer thread."""
@@ -644,14 +678,8 @@ class CostmapNode(Node):
             if cam.name not in ready_cameras:
                 continue
             saw_camera = True
-            road = self.segmenter(cam.img)
-            if self.use_white_lines:
-                # painted course lines are boundaries, not drivable
-                road = road & ~segmentation.white_line_mask(cam.img)
-            # clip to the camera's footprint: warpPerspective also fills
-            # mirror cells behind the camera plane (negative projective depth)
-            road_bev |= (bev.warp_to_bev(
-                road.astype(np.uint8) * 255, cam.H, self.grid) > 127) & cam.known
+            road, road_cells = self._camera_perception(cam)
+            road_bev |= road_cells
             known |= cam.known
             run_yolo = (self.yolo is not None and cam.name in selected_yolo
                         and cam.stamp != cam.last_yolo_stamp)
@@ -773,7 +801,7 @@ class CostmapNode(Node):
             self.get_logger().info(
                 "accuracy pipeline: yolo=%s cones=%s depth=%d ipm_fallback=%d "
                 "sync=%d/%d waits=%d confidence=%d/%d conf_reject=%d "
-                "depth_outlier=%d inference=%d/%d/%d" % (
+                "depth_outlier=%d inference=%d/%d/%d frames=%d/%d" % (
                     sorted(self._last_inference_cameras["yolo"]),
                     sorted(self._last_inference_cameras["cones"]),
                     self._depth_projections,
@@ -787,7 +815,8 @@ class CostmapNode(Node):
                     self._depth_outlier_rejected,
                     self.detector_worker.submitted,
                     self.detector_worker.replaced,
-                    self.detector_worker.completed))
+                    self.detector_worker.completed,
+                    self._percep_computed, self._percep_cached))
 
     def _on_reset(self, request, response):
         """Drop every accumulated observation and start as if freshly launched.
@@ -815,6 +844,7 @@ class CostmapNode(Node):
         for cam in self.cameras:
             cam.img, cam.stamp = None, 0.0
             cam.last_yolo_stamp = None
+            cam.percep_stamp, cam.percep = None, None
             cam.last_cone_stamp = None
             clear_sample_buffer(cam.depth_buffer)
             clear_sample_buffer(cam.confidence_buffer)
@@ -827,6 +857,7 @@ class CostmapNode(Node):
                         "_confidence_projections", "_confidence_missing",
                         "_confidence_rejected", "_depth_outlier_rejected",
                         "_depth_matches", "_depth_unmatched", "_depth_waits",
+                        "_percep_cached", "_percep_computed",
                         "_ticks", "_detector_errors"):
             setattr(self, counter, 0)
         self._last_detector_error_time = None
