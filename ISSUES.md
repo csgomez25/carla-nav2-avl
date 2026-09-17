@@ -454,7 +454,7 @@ All 94 keys were checked against wrapper v5.2.2's parameter tree. **Not yet
 run on the car.** `depth_stabilization: 0` is the one real tradeoff: if depth
 gets too noisy, set 1 and turn positional tracking back on.
 
-### P2 — the costmap node's main thread is its bottleneck — ON HOLD until car testing
+### P2 — the costmap node's main thread is its bottleneck — segmentation caching FIXED (`bc95360`), rest OPEN
 
 Profiled with 3 cameras at the car's rates (front 8 Hz, sides 15 Hz,
 960x600), the car's config minus the TensorRT models, laptop CPU, on
@@ -481,6 +481,17 @@ ticks at 8 Hz; more once the side cameras drop to 8 Hz with the lean profiles).
 PRs #1-#4 have been tested on the car (`DEPLOY.md` §7). The laptop profile
 shows where the time goes; the car's numbers decide which fixes are worth it.
 
+**Segmentation caching done (`bc95360`).** `_camera_perception(cam)` caches the
+road mask, the white-line subtraction and the BEV warp on the frame's stamp, so
+a tick that is handed a frame it has already processed reuses the result;
+`/perception/reset` drops the cache and the periodic log reports
+`frames=<computed>/<cached>`. Expect **~20% of ticks skipped on the lean stack**
+(8 Hz cameras against a 10 Hz tick), not the 53% measured on the competition
+preset, where the tick is slow enough that frames repeat far more often.
+**Not yet measured on the lean stack** — three attempts on 2026-09-17 were lost
+to wedged cameras, not to the code. The A/B (lean launch with and without the
+cache, same cameras throughout) is still owed.
+
 ### P3 — `DEPLOY.md` still blames TwinLiteNet, which the car no longer runs — FIXED (docs)
 
 `DEPLOY.md` §6 and `full_stack_restart.sh` ("TRT engine + TwinLiteNet") name
@@ -502,3 +513,142 @@ llvmpipe renders on the CPU the controller and perception share, and its
 camera panels keep all three RGB streams flowing. `perception_stack.launch.py`
 starts none of these; run them only while someone is watching. The boot
 service itself is unchanged until the lean launch has run on the car.
+
+---
+
+## Costmap quality, smoothness and efficiency (2026-09-17)
+
+Reviewed after the lean launch and the frame cache landed, looking for what
+actually makes the paths look "rough and amateur" rather than what makes the
+node slow. **P6 is the headline** — it is the one that changes what Nav2 plans
+against. The rest are ordered by effort, not by size of win.
+
+Suggested order: **P7 + P8 first** (visible smoothing, pure numpy/cv2 in
+ROS-free modules, so they are testable offline with no car), then finish
+measuring P2's cache, and schedule **P6 option 3** as its own piece of work
+before competition.
+
+### P5 — the competition preset runs at 2.6 Hz, 92% of it in one function — OPEN, filed on the frame-cache branch
+
+`line_bev.detect_bev` is 417 ms of a 452 ms tick and `_ridge_contrast` inside
+it is 330 ms, running full 800x800 work once per candidate component. Still
+the single largest CPU item anywhere in the stack, but it only affects
+`perception_competition.yaml`, not the lean/dinosaur configs.
+
+Full entry, the profile and a fix sketch live on `feature/christian-frame-cache`
+(PR #5) with `logs/results/2026-09-17_competition-preset-profile.md`; they are
+not duplicated here to keep one copy authoritative. Deliberately not
+implemented: it is the competition detector, so it wants an equivalence check
+against recorded frames rather than a blind edit.
+
+### P6 — the Nav2 bridge flattens a graded costmap into a binary ring — OPEN
+
+**This is the headline issue for path quality.**
+
+`deploy/costmap_to_cloud.py:36` forwards only cells at or above
+`obstacle_threshold: 97` as cloud points, and Nav2's ObstacleLayer marks every
+point it receives as binary lethal, then re-inflates with its *own*
+`inflation_radius` / `cost_scaling_factor`. So Nav2 never sees the shaping the
+perception layer just computed.
+
+What is lost, concretely:
+
+| perception computes | what reaches Nav2 |
+|---|---|
+| road-edge approach ramp, `road_edge_radius: 1.5` inward from off-road | only the cells that reach 97; the ramp below it is dropped |
+| per-class halos — `person_radius: 2.5`, `vehicle_radius: 1.5`, `cone_radius: 0.6`, exponential decay | one binary ring, re-inflated with a single Nav2 radius |
+| graded costs 1-96 (caution) | nothing |
+
+`perception_dinosaur.yaml:191-202` already works around this: the
+`*_exclusion_radius` values exist specifically so a class's *core* survives the
+>=97 threshold. So the lethal core does get through — it is the **gradient**
+outside it that does not, which is exactly the part that makes a planner curve
+around an obstacle instead of hugging a binary ring.
+
+Three fixes, increasing effort:
+
+1. **Match Nav2's inflation to perception's shaping** (config only, ~1 h).
+   Set Nav2's `inflation_radius` / `cost_scaling_factor` to approximate the ramp
+   perception already computes. Cheap, approximate, reversible — worth doing as
+   a stopgap even if 3 is planned.
+2. **Two observation sources** (~half a day). One at >=97 (lethal), one at a mid
+   threshold into a separate layer with a smaller inflation. Keeps some
+   gradation; hacky, and doubles the cloud bandwidth.
+3. **A Nav2 costmap plugin that consumes `/perception/costmap` directly**
+   (C++, ~1 day). The graded grid goes in whole: no threshold, no re-inflation.
+   The proper fix, and the one that would most change how the paths look.
+
+### P7 — the temporal filter has no hysteresis, so edge cells flicker — OPEN
+
+`perception_costmap/temporal.py:85,99` — one threshold for both directions:
+
+```python
+def __init__(self, shape, hit=0.4, miss=0.2, threshold=0.5):
+...
+return self.conf >= self.threshold
+```
+
+Confidence is clipped to [0, 1], so from zero a cell becomes lethal after **2
+detections** (0.4, 0.8) and from saturation clears after **3 misses** (0.8,
+0.6, 0.4). At 10 Hz that is 0.2 s to mark and 0.3 s to clear — fine on its own.
+
+The problem is the single threshold. A cell detected intermittently — roughly
+one frame in three, which is what a noisy obstacle edge looks like — nets
+`+0.4 - 0.2 - 0.2 = 0` and sits *on* the threshold, crossing it in both
+directions every few ticks. Each crossing adds or removes a lethal cell plus
+its whole halo, and the planner twitches in response.
+
+Fix: separate enter/exit thresholds (e.g. enter 0.6, exit 0.35). A cell must be
+clearly seen to become lethal and clearly unseen to clear, so boundary cells
+stop toggling — without slowing down real detections, which saturate anyway.
+Contained in a ROS-free module with existing tests; fully testable offline.
+
+### P8 — no speckle opening on the fused obstacle grid — OPEN
+
+Off-road regions get a morphological opening before the road-edge ramp
+(`occupancy.py:267`, `min_offroad_width_m`), and the image-space masks get one
+in the classical detector (`obstacles.py:46`) and the road segmenter
+(`segmentation.py:65`). The **fused BEV obstacle grid does not**.
+
+So an isolated 1-2 cell blob — the normal output of IPM scatter on sloped
+ground, see P10 — becomes a lethal core with a full halo around it, and the
+planner swerves around a ghost. A 3x3 opening on the obstacle grid before
+inflation removes exactly this and leaves any obstacle bigger than a couple of
+cells untouched.
+
+Cheap, and like P7 it is numpy/cv2 in a ROS-free module.
+
+### P9 — depth and confidence images are converted eagerly in the callbacks — OPEN
+
+`costmap_node.py:91-104` — every depth and every confidence message runs through
+`cv_bridge.imgmsg_to_cv2` inside the subscription callback, for all three
+cameras, whether or not that frame is ever used for a detection. With the lean
+profiles that is 3 cameras x 8 Hz x 2 conversions per second of work that the
+tick may never look at.
+
+Fix: keep the raw message and convert lazily on first use (the same shape as
+the P2 cache — store the message, convert once, key on stamp). Lower value than
+P7/P8 and it touches the callback path, so it wants the A/B harness working
+first so the saving can actually be shown.
+
+### P10 — only ~29% of obstacle projections use depth — OPEN, measure before tuning
+
+The rest fall back to flat-ground IPM, which places obstacles wrongly on sloped
+ground — and a wrong-but-consistent position still produces jitter as the
+fallback and the depth path disagree between frames. Measured on the car:
+`depth_outlier` ~69k per 10 s (`LEAN_STACK.md`).
+
+**Do not tune anything yet.** Three different gates can reject a depth
+projection — the MAD outlier filter, the confidence gate, and the 50 ms
+`depth_sync` window — and the counters currently in the periodic log do not say
+which one is doing it. Instrument first: split the reject counter per gate, run
+it on the car, then tune whichever dominates.
+
+### P11 — `/perception/known` was published to nobody — FIXED (`19b58c5`)
+
+The node built and serialised a second full 200x200 OccupancyGrid every tick
+regardless of subscribers. Only the colorizer reads it; the Nav2 bridge and the
+planner use `/perception/costmap`. Now guarded on
+`get_subscription_count()`, so a run without a viewer attached — every
+competition run — stops paying for it, and RViz still gets it the moment it
+connects.
